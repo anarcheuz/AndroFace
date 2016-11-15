@@ -135,7 +135,7 @@ vector<string> check_file_properties(const string &path) {
 	smatch match;
 
 	try {
-		if(regex_search(output, match, pattern_r) && match.size() > 1) {
+		if(regex_search(output, match, pattern_r) && match.size() == 6) {
 			res.push_back(match.str(1)); // imprecise ACL
 			res.push_back(match.str(2)); // owner
 			res.push_back(match.str(3)); // group
@@ -178,7 +178,7 @@ void get_av(vector<string> &subtags, map<string, vector<string>> &permissions) {
 	}
 }
 
-void lookup_directory(const string &dir_path, vector<vector<string>> &result, int &depth) {
+void lookup_directory(const string &dir_path, vector<vector<string>> &result, int depth) {
 	struct dirent *dir = nullptr;
 	shared_ptr<DIR> d{opendir(dir_path.c_str()), closedir};
 
@@ -193,7 +193,7 @@ void lookup_directory(const string &dir_path, vector<vector<string>> &result, in
 			string filename = string{dir->d_name};
 			string full_path;
 			char *tmp = nullptr;
-			
+
 			if(filename.compare(".") == 0 || filename.compare("..") == 0)
 				continue;
 
@@ -209,12 +209,10 @@ void lookup_directory(const string &dir_path, vector<vector<string>> &result, in
 
 			// if is a directory
 			if(dir->d_type == DT_DIR) {
-				if(!is_dir_allowed(full_path)) 
-					continue;
-				else if(find(visitedDirectory.begin(), visitedDirectory.end(), full_path) != visitedDirectory.end()) 
-					continue;
-				else 
+				if(is_dir_allowed(full_path) 
+					&& find(visitedDirectory.begin(), visitedDirectory.end(), full_path) == visitedDirectory.end()) 
 					lookup_directory(full_path.c_str(), result, depth);
+				continue;
 			}
 
 			vector<string> properties = check_file_properties(full_path);
@@ -227,7 +225,7 @@ void lookup_directory(const string &dir_path, vector<vector<string>> &result, in
 }
 
 void get_attack_surface(vector<string> subtags) {
-	vector<string> folders{"/dev", "/sys", "/proc"};
+	vector<string> folders{"/dev", "/proc", "/sys"};
 	map<string, vector<string>> permissions;
 
 	cout << "[..] Processing access vectors" << endl;
@@ -241,7 +239,7 @@ void get_attack_surface(vector<string> subtags) {
 		int depth{0};
 
 		cout << "[..] Fetching from: " << folder << endl << endl;
-
+		
 		lookup_directory(folder, files, depth);
 
 		for(auto &file: files) {
@@ -249,8 +247,9 @@ void get_attack_surface(vector<string> subtags) {
 				continue;
 			for(auto &perm: permissions) {
 				if(perm.first.compare(file.at(file.size()-2)) == 0) { // print selinux permissions on file and access rights
-					cout << file[0] << "\t";
-					cout << file[1] << "\t";
+					cout << file[0] << "\t\t";
+					cout << "current access rights: " << file[1] << "\t\t";
+					cout << "general access rights: " << file[2] << "\t\t";
 					cout << perm.second.at(0) << " [" << perm.second.at(1) << "]";
 					cout << endl;
 				}
