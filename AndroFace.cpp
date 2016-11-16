@@ -1,3 +1,8 @@
+/*
+	Author: @anarcheuz
+	script to find kernel attack surface on Android, superSU must be present on device !
+*/
+
 #include <cstdio>
 #include <cstdlib>
 #include <cerrno>
@@ -12,6 +17,7 @@
 #include <algorithm>
 #include <sstream>
 #include <regex>
+#include <iomanip>
 
 #include <memory>
 
@@ -90,7 +96,7 @@ void dump_av() {
 // some useless folder, can speed up lookup process
 bool is_dir_allowed(const string path) {
 	vector<string> blacklist{"/proc/irq/", "/proc/sys/", "/proc/device-tree/", "/sys/fs/selinux/", "/sys/devices/", "/sys/bus/", "/sys/class/", "/sys/kernel/"};
-	regex procID_r{"^/proc/\\d+.*"};
+	regex procID_r{"^(/proc/\\d)(.*)"};
 
 	for(auto &v : blacklist)
 		if(path.find(v) != string::npos || regex_match(path, procID_r))
@@ -124,12 +130,12 @@ vector<string> check_file_properties(const string &path) {
 	vector<string> res;
 	string acl{""};
 	string output;
-	const char *args[] = {"/system/bin/ls", "-lZa", path.c_str(), nullptr};
+	const char *args[] = {"/su/bin/su", "-c", "/system/bin/ls", "-lZa", path.c_str(), nullptr};
 
 	check_acl(path, acl);
 	res.push_back(acl);
 
-	exec("/system/bin/ls", (char **)args, output);
+	exec("/su/bin/su", (char **)args, output);
 
 	regex pattern_r{"([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+)"};
 	smatch match;
@@ -178,50 +184,55 @@ void get_av(vector<string> &subtags, map<string, vector<string>> &permissions) {
 	}
 }
 
-void lookup_directory(const string &dir_path, vector<vector<string>> &result, int depth) {
-	struct dirent *dir = nullptr;
-	shared_ptr<DIR> d{opendir(dir_path.c_str()), closedir};
+void lookup_directory(const string &dir_path, vector<map<string, string>> &result, int depth) {
+	const char *args[] = {"/su/bin/su", "-c", "/system/bin/ls", "-lZa", dir_path.c_str(), nullptr};
+	string output, line;
+	regex pattern_r{"([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+).*"};
+	smatch match;
 
 	// don't lookup too much in subdirectories, less probable to have device driver there ..
 	if(++depth > 64) 
 		return;
 
-	if(d) {
-		visitedDirectory.push_back(dir_path);
+	visitedDirectory.push_back(dir_path);
+	exec("/su/bin/su", (char **)args, output);
 
-		while((dir = readdir(d.get())) != nullptr) {
-			string filename = string{dir->d_name};
-			string full_path;
-			char *tmp = nullptr;
+	stringstream ss{output};
 
-			if(filename.compare(".") == 0 || filename.compare("..") == 0)
-				continue;
+	while(getline(ss, line, '\n')) {
+		try {
+			if(regex_search(line, match, pattern_r) && match.size() == 6) {
+				string acl = match.str(1), acl2;
 
-			full_path = dir_path + "/" + filename;
+				map<string, string> file;
+				file["acl"] = acl;
+				file["owner"] = match.str(2);
+				file["group"] = match.str(3);
+				file["context"] = split(match.str(4), ':')[2];
+				file["name"] = match.str(5);
+				file["path"] = dir_path + "/" + file["name"];
 
-			// if is a symbolic link, resolve it, always work on absolute path
-			if(dir->d_type == DT_LNK) {
-				tmp = realpath(full_path.c_str(), nullptr);
-				full_path = tmp;
-				free(tmp);
+				// if is a symbolic link, we dont process it (suppose will appear later on /dev, /sys or /proc)
+				// normally accessible drivers should be in these locations
+				if(acl.size()>0 && acl[0] == 'l') {
+					// cout << "[-] Ignored symlink: " << file["path"] << endl;
+					continue;
+				}
+
+				if(acl.size()>0 && acl[0] == 'd') {
+					if(is_dir_allowed(file["path"]) && find(visitedDirectory.begin(), visitedDirectory.end(), file["path"]) == visitedDirectory.end())
+						lookup_directory(file["path"], result, depth);
+					continue;
+				}
+
+				check_acl(file["path"], acl2);
+				file["access"] = acl2;
+				result.push_back(file);
 			}
-
-
-			// if is a directory
-			if(dir->d_type == DT_DIR) {
-				if(is_dir_allowed(full_path) 
-					&& find(visitedDirectory.begin(), visitedDirectory.end(), full_path) == visitedDirectory.end()) 
-					lookup_directory(full_path.c_str(), result, depth);
-				continue;
-			}
-
-			vector<string> properties = check_file_properties(full_path);
-			properties.insert(properties.begin(), full_path);
-			result.push_back(properties);
-		}
-	} 
-	else
-		perror(dir_path.c_str());
+		} catch(regex_error &e) {
+	    	cerr << "Regex exception: " << e.what() << endl;
+	    } 
+	}
 }
 
 void get_attack_surface(vector<string> subtags) {
@@ -235,23 +246,24 @@ void get_attack_surface(vector<string> subtags) {
 	get_av(subtags, permissions);
 
 	for(auto &folder: folders) {
-		vector<vector<string>> files;
+		vector<map<string, string>> files;
 		int depth{0};
 
 		cout << "[..] Fetching from: " << folder << endl << endl;
 		
 		lookup_directory(folder, files, depth);
 
+
 		for(auto &file: files) {
-			if(file[1].size() < 1) // we have no access on file...
+			if(file["access"].size() == 0) // we have no access on file...
 				continue;
 			for(auto &perm: permissions) {
-				if(perm.first.compare(file.at(file.size()-2)) == 0) { // print selinux permissions on file and access rights
-					cout << file[0] << "\t\t";
-					cout << "current access rights: " << file[1] << "\t\t";
-					cout << "general access rights: " << file[2] << "\t\t";
-					cout << perm.second.at(0) << " [" << perm.second.at(1) << "]";
-					cout << endl;
+				if(perm.first.compare(file["context"]) == 0) { // print selinux permissions on file and access rights
+					cout << file["path"] << endl;
+					printf("\towner: %-15s", file["owner"].c_str());
+					printf("current user acl: %-10s", file["access"].c_str());
+					printf("general acl: %-15s", file["acl"].c_str());
+					printf("selinux context: %s [%s]\n", perm.second[0].c_str(), perm.second[1].c_str());
 				}
 			}
 		}
@@ -291,6 +303,14 @@ void help(char *argv[]) {
 }
 
 int main(int argc, char *argv[]) {
+	string acl;
+
+	check_acl("/su/bin/su", acl);
+
+	if(acl.find("r") == string::npos && acl.find("x") == string::npos) {
+		cout << "[-] Need superSU to work !" << endl;
+		exit(0);
+	}
 
 	if(argc > 2 && strcmp(argv[1], "find") == 0) {
 		vector<string> subtags{argv[2]};
