@@ -31,6 +31,9 @@
 
 typedef char * security_context_t;
 
+static const char *su_path = "/su/bin/su";
+static const char *su_switch = "-c";
+
 using namespace std;
 
 // <file, <selinux context id, selinux permissions, ACL>>
@@ -87,7 +90,18 @@ int isLink(const char *path){
 		exit(1);
 	}
 
-	return (sb.st_mode & S_IFLNK);
+	return S_ISLNK(sb.st_mode);
+}
+
+int isDir(const char *path){
+	struct stat sb;
+	
+	if(lstat(path, &sb) == -1) {
+		perror("lstat");
+		exit(1);
+	}
+
+	return S_ISDIR(sb.st_mode);
 }
 
 
@@ -147,9 +161,9 @@ int lgetfilecon(const char *path, security_context_t * context) {
 
 void dump_av() {
 	string output;
-	const char *args[] = {"/su/bin/su", "-c", "supolicy --dumpav", nullptr};
+	const char *args[] = {su_path, su_switch, "supolicy --dumpav", nullptr};
 
-	exec("/su/bin/su", (char **)args, output);
+	exec(su_path, (char **)args, output);
 
 	istringstream f(output);
     string line;  
@@ -206,12 +220,12 @@ vector<string> check_file_properties(const string &path) {
 	vector<string> res;
 	string acl{""};
 	string output;
-	const char *args[] = {"/su/bin/su", "-c", "/system/bin/ls", "-lZa", path.c_str(), nullptr};
+	const char *args[] = {su_path, su_switch, "/system/bin/ls", "-lZa", path.c_str(), nullptr};
 
 	check_acl(path, acl);
 	res.push_back(acl);
 
-	exec("/su/bin/su", (char **)args, output);
+	exec(su_path, (char **)args, output);
 
 	regex pattern_r{"([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+)"};
 	smatch match;
@@ -261,7 +275,7 @@ void get_av(vector<string> &subtags, map<string, vector<string>> &permissions) {
 }
 
 void lookup_directory(const string &dir_path, vector<map<string, string>> &result, int depth) {
-	const char *args[] = {"/su/bin/su", "-c", "/system/bin/ls", "-lZa", dir_path.c_str(), nullptr};
+	const char *args[] = {su_path, su_switch, "/system/bin/ls", "-lZa", dir_path.c_str(), nullptr};
 	string output, line;
 	regex pattern_r{"([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+).*"};
 	smatch match;
@@ -271,7 +285,7 @@ void lookup_directory(const string &dir_path, vector<map<string, string>> &resul
 		return;
 
 	visitedDirectory.push_back(dir_path);
-	exec("/su/bin/su", (char **)args, output);
+	exec(su_path, (char **)args, output);
 
 	stringstream ss{output};
 
@@ -380,38 +394,64 @@ void help(char *argv[]) {
 }
 
 
+/*
+	if device is not root, try to acquire root and fork a new instance
+	that can use dumpav
+*/
 int main(int argc, char *argv[]) {
-	string acl;
+	string acl, output;
 
-	security_context_t con;
-	getfilecon ("/dev/mali0", &con);
-	printf("Security context is %s\n", con);
+	const char *args[] = {"/system/bin/id", nullptr};
+	exec("/system/bin/id", (char **)args, output);
+	if(output.find("uid=0(root)") == string::npos) {
+		cout << "[.] Try to get root privilege.." << endl;
 
-	// check_acl("/su/bin/su", acl);
+		check_acl(su_path, acl);
 
-	// if(acl.find("r") == string::npos && acl.find("x") == string::npos) {
-	// 	cout << "[-] Need superSU to work !" << endl;
-	// 	exit(0);
-	// }
+		if(acl.find("r") == string::npos && acl.find("x") == string::npos) {
+			cout << "[-] Need superSU to work !" << endl;
+			return -1;
+		}
 
-	// if(argc > 2 && strcmp(argv[1], "find") == 0) {
-	// 	vector<string> subtags{argv[2]};
-	// 	get_attack_surface(subtags);
-	// }
-	// else if(argc > 2 && strcmp(argv[1], "rfind") == 0)
-	// 	get_reachable_from(argv[2]);
-	// else
-	// 	help(argv);
+		pid_t child;
+		if((child = fork()) == -1) {
+			perror("fork");
+			return -1;
+		} else if(child == 0) {
+			char **args2 = (char **) malloc(sizeof(char *) *(argc + 3));
+			
+			args2[0] = (char *)su_path;
+			args2[1] = (char *)su_switch;
+			for(auto i = 2; i < argc + 2; ++i)
+				args2[i] = argv[i-2];
+
+			args2[argc + 2] = nullptr;
+
+			execvp("/su/bin/su", args2);
+			perror("execv");
+			return -1;
+		} else {
+			waitpid(child, nullptr, __WALL);
+			return 0;
+		}
+	}
+
+	cout << "[+] root privilege acquired" << endl;
+
+	if(argc > 2 && strcmp(argv[1], "find") == 0) {
+		vector<string> subtags{argv[2]};
+		get_attack_surface(subtags);
+	}
+	else if(argc > 2 && strcmp(argv[1], "rfind") == 0)
+		get_reachable_from(argv[2]);
+	else
+		help(argv);
 
 	return 0;
 }
 
 /*
-
- r = (deref
-         ? getfilecon (file, &f->scontext)
-         : lgetfilecon (file, &f->scontext));
-
-int attr_len = getfilecon_cache (absolute_name, f, do_deref);
-int n = file_has_acl_cache (absolute_name, f);
+security_context_t con;
+	getfilecon ("/dev/mali0", &con);
+	printf("Security context is %s\n", con);
 */
