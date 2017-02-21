@@ -9,6 +9,11 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/types.h>
+#include <sys/xattr.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+
 
 #include <iostream>
 #include <map>
@@ -20,6 +25,11 @@
 #include <iomanip>
 
 #include <memory>
+
+
+#define XATTR_NAME_SELINUX "security.selinux"
+
+typedef char * security_context_t;
 
 using namespace std;
 
@@ -67,6 +77,72 @@ void exec(const char *cmd, char **argv, string &output) {
 		waitpid(child, &status, __WALL);
 		close(pipefd[0]);
 	}
+}
+
+int isLink(const char *path){
+	struct stat sb;
+	
+	if(lstat(path, &sb) == -1) {
+		perror("lstat");
+		exit(1);
+	}
+
+	return (sb.st_mode & S_IFLNK);
+}
+
+
+int getfilecon(const char *path, security_context_t * context) {
+	ssize_t size, ret;
+	char *buf;
+
+	size = getxattr(path, XATTR_NAME_SELINUX, NULL, 0);
+	if(size < 0) {
+		perror("getxattr");
+		exit(1);
+	}
+
+	buf = static_cast<char*>(malloc(++size));
+	if(!buf) {
+		perror("malloc");
+		exit(1);
+	}
+
+	ret = getxattr(path, XATTR_NAME_SELINUX, buf, size - 1);
+	if(ret < 0) {
+		perror("getxattr2");
+		free(buf);
+		exit(1);
+	}
+
+	*context = buf;
+	return ret;
+}
+
+int lgetfilecon(const char *path, security_context_t * context) {
+	ssize_t size, ret;
+	char *buf;
+
+	size = lgetxattr(path, XATTR_NAME_SELINUX, NULL, 0);
+	if(size < 0) {
+		perror("getxattr");
+		exit(1);
+	}
+
+	buf = static_cast<char*>(malloc(++size));
+	if(!buf) {
+		perror("malloc");
+		exit(1);
+	}
+
+	ret = lgetxattr(path, XATTR_NAME_SELINUX, buf, size - 1);
+	if(ret < 0) {
+		perror("getxattr2");
+		free(buf);
+		exit(1);
+	}
+
+	*context = buf;
+	return ret;
 }
 
 void dump_av() {
@@ -296,30 +372,46 @@ void get_reachable_from(const string &path) {
 	}
 }
 
+
 void help(char *argv[]) {
 	cout << "Usage: " << argv[0] << " <find|rfind> <tag|path>" << endl << endl;
 	cout << "find\t" << "find all accessible device driver from tag" << endl;
 	cout << "rfind\t" << "find all context tag who can access the device driver at path" << endl;
 }
 
+
 int main(int argc, char *argv[]) {
 	string acl;
 
-	check_acl("/su/bin/su", acl);
+	security_context_t con;
+	getfilecon ("/dev/mali0", &con);
+	printf("Security context is %s\n", con);
 
-	if(acl.find("r") == string::npos && acl.find("x") == string::npos) {
-		cout << "[-] Need superSU to work !" << endl;
-		exit(0);
-	}
+	// check_acl("/su/bin/su", acl);
 
-	if(argc > 2 && strcmp(argv[1], "find") == 0) {
-		vector<string> subtags{argv[2]};
-		get_attack_surface(subtags);
-	}
-	else if(argc > 2 && strcmp(argv[1], "rfind") == 0)
-		get_reachable_from(argv[2]);
-	else
-		help(argv);
+	// if(acl.find("r") == string::npos && acl.find("x") == string::npos) {
+	// 	cout << "[-] Need superSU to work !" << endl;
+	// 	exit(0);
+	// }
+
+	// if(argc > 2 && strcmp(argv[1], "find") == 0) {
+	// 	vector<string> subtags{argv[2]};
+	// 	get_attack_surface(subtags);
+	// }
+	// else if(argc > 2 && strcmp(argv[1], "rfind") == 0)
+	// 	get_reachable_from(argv[2]);
+	// else
+	// 	help(argv);
 
 	return 0;
 }
+
+/*
+
+ r = (deref
+         ? getfilecon (file, &f->scontext)
+         : lgetfilecon (file, &f->scontext));
+
+int attr_len = getfilecon_cache (absolute_name, f, do_deref);
+int n = file_has_acl_cache (absolute_name, f);
+*/
