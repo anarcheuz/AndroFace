@@ -13,7 +13,10 @@
 #include <sys/xattr.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-
+#include <sys/types.h>
+#include <dirent.h>
+#include <sys/mman.h>
+#include <fcntl.h>
 
 #include <iostream>
 #include <map>
@@ -36,14 +39,26 @@ static const char *su_switch = "-c";
 
 using namespace std;
 
-// <file, <selinux context id, selinux permissions, ACL>>
-static map<string, tuple<string, string, string>> validFiles;
 static vector<string> visitedDirectory;
 
 // [TYPE] 1700: shell (ENFORCING) [mlstrustedsubject newAttr6 newAttr4]
 static vector<tuple<int, string, string, string>> types;
 // [AV] 1266: ALLOW felica_app-->fimg2d_video_device (chr_file) [write ioctl read open]
 static vector<tuple<int, string, string, string, string, string>> av;
+
+#define MAX_FILES (2 << 15)
+
+struct File {
+	char path[256];
+	uid_t owner;
+	gid_t group;
+	char perms[10];
+	char real_perms[4];
+	char tag[32];
+	char secontext[128];
+};
+
+File *files;
 
 void exec(const char *cmd, char **argv, string &output) {
 	int status, len, pipefd[2];
@@ -82,30 +97,16 @@ void exec(const char *cmd, char **argv, string &output) {
 	}
 }
 
-int isLink(const char *path){
-	struct stat sb;
-	
-	if(lstat(path, &sb) == -1) {
-		perror("lstat");
-		exit(1);
-	}
-
+int isLink(struct stat &sb){
 	return S_ISLNK(sb.st_mode);
 }
 
-int isDir(const char *path){
-	struct stat sb;
-	
-	if(lstat(path, &sb) == -1) {
-		perror("lstat");
-		exit(1);
-	}
-
+int isDir(struct stat &sb){
 	return S_ISDIR(sb.st_mode);
 }
 
 
-int getfilecon(const char *path, security_context_t * context) {
+int getfilecon(const char *path, security_context_t *context) {
 	ssize_t size, ret;
 	char *buf;
 
@@ -129,34 +130,23 @@ int getfilecon(const char *path, security_context_t * context) {
 	}
 
 	*context = buf;
-	return ret;
+	return size;
 }
 
-int lgetfilecon(const char *path, security_context_t * context) {
-	ssize_t size, ret;
-	char *buf;
+void get_perms(struct stat &sb, File *curFile) {
+	string perms;
 
-	size = lgetxattr(path, XATTR_NAME_SELINUX, NULL, 0);
-	if(size < 0) {
-		perror("getxattr");
-		exit(1);
-	}
+	perms += (sb.st_mode & S_IRUSR) ? "r" : "-";
+	perms += (sb.st_mode & S_IWUSR) ? "w" : "-";
+	perms += (sb.st_mode & S_IXUSR) ? "x" : "-";
+	perms += (sb.st_mode & S_IRGRP) ? "r" : "-";
+	perms += (sb.st_mode & S_IWGRP) ? "w" : "-";
+	perms += (sb.st_mode & S_IXGRP) ? "x" : "-";
+	perms += (sb.st_mode & S_IROTH) ? "r" : "-";
+	perms += (sb.st_mode & S_IWOTH) ? "w" : "-";
+	perms += (sb.st_mode & S_IXOTH) ? "x" : "-";
 
-	buf = static_cast<char*>(malloc(++size));
-	if(!buf) {
-		perror("malloc");
-		exit(1);
-	}
-
-	ret = lgetxattr(path, XATTR_NAME_SELINUX, buf, size - 1);
-	if(ret < 0) {
-		perror("getxattr2");
-		free(buf);
-		exit(1);
-	}
-
-	*context = buf;
-	return ret;
+	memcpy(curFile->perms, perms.c_str(), perms.size());
 }
 
 void dump_av() {
@@ -195,14 +185,9 @@ bool is_dir_allowed(const string path) {
 }
 
 void check_acl(const string &path, string &acl) {
-	if(access(path.c_str(), F_OK | R_OK) == 0)
-		acl += "r:";
-	if(access(path.c_str(), F_OK | W_OK) == 0)
-		acl += "w:";
-	if(access(path.c_str(), F_OK | X_OK) == 0)
-		acl += "x:";
-
-	acl = acl.substr(0, acl.size()-1);
+	acl += access(path.c_str(), F_OK | R_OK) == 0 ? "r" : "-";
+	acl += access(path.c_str(), F_OK | W_OK) == 0 ? "w" : "-";
+	acl += access(path.c_str(), F_OK | X_OK) == 0 ? "x" : "-";
 }
 
 vector<string> split(const string &source, char sep) {
@@ -214,36 +199,6 @@ vector<string> split(const string &source, char sep) {
 		res.push_back(item);
 
 	return res;
-}
-
-vector<string> check_file_properties(const string &path) {
-	vector<string> res;
-	string acl{""};
-	string output;
-	const char *args[] = {su_path, su_switch, "/system/bin/ls", "-lZa", path.c_str(), nullptr};
-
-	check_acl(path, acl);
-	res.push_back(acl);
-
-	exec(su_path, (char **)args, output);
-
-	regex pattern_r{"([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+)"};
-	smatch match;
-
-	try {
-		if(regex_search(output, match, pattern_r) && match.size() == 6) {
-			res.push_back(match.str(1)); // imprecise ACL
-			res.push_back(match.str(2)); // owner
-			res.push_back(match.str(3)); // group
-			string tag = split(match.str(4), ':')[2];
-			res.push_back(tag); // selinux context
-			res.push_back(match.str(5)); // filename
-		}
-	} catch(regex_error &e) {
-    	cerr << "Regex exception: " << e.what() << endl;
-    }  
-
-    return res;
 }
 
 void get_subtags(vector<string> &subtags) {
@@ -265,69 +220,104 @@ void get_subtags(vector<string> &subtags) {
 	}
 }
 
-void get_av(vector<string> &subtags, map<string, vector<string>> &permissions) {
+void get_av(vector<string> &subtags, map<string, string> &permissions) {
 	for(auto &vect: av) {	
 		if(get<1>(vect).compare("ALLOW") == 0 && find(subtags.begin(), subtags.end(), get<2>(vect)) != subtags.end()) {
-			vector<string> perm{get<4>(vect), get<5>(vect)};
-			permissions[get<3>(vect)] = perm;
+			permissions[get<3>(vect)] = get<4>(vect) + " [" + get<5>(vect) + "]";
 		}
 	}
 }
 
-void lookup_directory(const string &dir_path, vector<map<string, string>> &result, int depth) {
-	const char *args[] = {su_path, su_switch, "/system/bin/ls", "-lZa", dir_path.c_str(), nullptr};
-	string output, line;
-	regex pattern_r{"([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+)\\s+([^\\s]+).*"};
-	smatch match;
+void lookup_directory(const string &dir_path, int depth, map<string, string> permissions) {
+	DIR *dirp;
+	struct dirent *entry;  
+	string file_path;
 
 	// don't lookup too much in subdirectories, less probable to have device driver there ..
 	if(++depth > 64) 
 		return;
 
 	visitedDirectory.push_back(dir_path);
-	exec(su_path, (char **)args, output);
 
-	stringstream ss{output};
-
-	while(getline(ss, line, '\n')) {
-		try {
-			if(regex_search(line, match, pattern_r) && match.size() == 6) {
-				string acl = match.str(1), acl2;
-
-				map<string, string> file;
-				file["acl"] = acl;
-				file["owner"] = match.str(2);
-				file["group"] = match.str(3);
-				file["context"] = split(match.str(4), ':')[2];
-				file["name"] = match.str(5);
-				file["path"] = dir_path + "/" + file["name"];
-
-				// if is a symbolic link, we dont process it (suppose will appear later on /dev, /sys or /proc)
-				// normally accessible drivers should be in these locations
-				if(acl.size()>0 && acl[0] == 'l') {
-					// cout << "[-] Ignored symlink: " << file["path"] << endl;
-					continue;
-				}
-
-				if(acl.size()>0 && acl[0] == 'd') {
-					if(is_dir_allowed(file["path"]) && find(visitedDirectory.begin(), visitedDirectory.end(), file["path"]) == visitedDirectory.end())
-						lookup_directory(file["path"], result, depth);
-					continue;
-				}
-
-				check_acl(file["path"], acl2);
-				file["access"] = acl2;
-				result.push_back(file);
+	if ((dirp = opendir(dir_path.c_str())) != NULL)
+	{
+		while(entry = readdir(dirp)) {
+			if(strncmp(entry->d_name, ".", 2) == 0)
+				continue;
+			else if(strncmp(entry->d_name, "..", 3) == 0)
+				continue;
+			
+			file_path = dir_path + "/" + entry->d_name;
+			struct stat sb;
+	
+			if(lstat(file_path.c_str(), &sb) == -1) {
+				perror("lstat");
+				exit(1);
 			}
-		} catch(regex_error &e) {
-	    	cerr << "Regex exception: " << e.what() << endl;
-	    } 
+
+			// don't follow symbolic links
+			if(isLink(sb))
+				continue;
+
+			if(isDir(sb)) { 
+				if(is_dir_allowed(file_path) && find(visitedDirectory.begin(), visitedDirectory.end(), file_path) == visitedDirectory.end())
+					lookup_directory(file_path, depth, permissions);
+				continue;
+			}
+
+			int *pos = (int *)files;
+			File *curFile = &files[*pos];
+
+			// First get selinux context and if not in reachable, we skip
+			security_context_t context;
+			int size = getfilecon(file_path.c_str(), &context);
+			string context_ = context;
+			free(context);
+
+			vector<string> context_vec = split(context_, ':');
+
+			bool accessible = false;
+			for(auto &perm: permissions) {
+				if(perm.first.compare(context_vec[2]) == 0) {
+					memcpy(curFile->secontext, perm.second.c_str(), perm.second.size());
+					accessible = true;
+					break;
+				}
+			}
+
+			if(!accessible)
+				continue;
+
+			memcpy(curFile->tag, context_vec[2].c_str(), context_vec[2].size());
+
+			// get normal info and perms
+
+			memcpy(curFile->path, file_path.c_str(), file_path.size());
+			curFile->owner = sb.st_uid;
+			curFile->group = sb.st_gid;
+
+			get_perms(sb, curFile);
+
+			// inc offset
+			++(*pos);
+			if(*pos > MAX_FILES) {
+				cerr << "mmap overflow: " << *pos << " > " << MAX_FILES / sizeof(struct File) << endl;
+				exit(-1);
+			}
+
+		}
+
+		closedir(dirp);
+	}
+	else {
+		perror("opendir");
+		exit(-1);
 	}
 }
 
 void get_attack_surface(vector<string> subtags) {
 	vector<string> folders{"/dev", "/proc", "/sys"};
-	map<string, vector<string>> permissions;
+	map<string, string> permissions;
 
 	cout << "[..] Processing access vectors" << endl;
 
@@ -336,39 +326,46 @@ void get_attack_surface(vector<string> subtags) {
 	get_av(subtags, permissions);
 
 	for(auto &folder: folders) {
-		vector<map<string, string>> files;
 		int depth{0};
 
-		cout << "[..] Fetching from: " << folder << endl << endl;
-		
-		lookup_directory(folder, files, depth);
+		cout << "[..] Fetching from: " << folder << endl;
 
+		lookup_directory(folder, depth, permissions);
+	}
+}
 
-		for(auto &file: files) {
-			if(file["access"].size() == 0) // we have no access on file...
-				continue;
-			for(auto &perm: permissions) {
-				if(perm.first.compare(file["context"]) == 0) { // print selinux permissions on file and access rights
-					cout << file["path"] << endl;
-					printf("\towner: %-15s", file["owner"].c_str());
-					printf("current user acl: %-10s", file["access"].c_str());
-					printf("general acl: %-15s", file["acl"].c_str());
-					printf("selinux context: %s [%s]\n", perm.second[0].c_str(), perm.second[1].c_str());
-				}
-			}
-		}
+void show_attack_surface() {
+	int pos = *(int *)files;
 
-		cout << endl << endl;
+	cout << "[+] Results: " << endl << endl;
+	
+	for(int i = 1; i < pos; ++i) {
+		string acl;
+		File *curFile = &files[i];
+
+		check_acl(curFile->path, acl);
+
+		if(acl == "---") // no read access means not reachable
+			continue;
+
+		memcpy(curFile->real_perms, acl.c_str(), acl.size());
+
+		cout << curFile->path << endl;
+		cout << "\t" << curFile->owner << "\t" << curFile->group << "\t" << curFile->perms << "\t" << curFile->real_perms;
+		cout << "\t" << curFile->tag << "\t" << curFile->secontext << endl;
 	}
 }
 
 void get_reachable_from(const string &path) {
-	string tag;
-	vector<string> tmp;
 	dump_av();
 
-	tmp = check_file_properties(path);
-	tag = tmp.at(tmp.size()-2);
+	security_context_t context;
+	int size = getfilecon(path.c_str(), &context);
+	string context_ = context;
+	free(context);
+
+	vector<string> context_vec = split(context_, ':');
+	string tag = context_vec[2];
 
 	cout << "Reachable from these contexts: " << endl << endl;
 	for(auto &vect: av) {
@@ -393,16 +390,29 @@ void help(char *argv[]) {
 	cout << "rfind\t" << "find all context tag who can access the device driver at path" << endl;
 }
 
-
 /*
 	if device is not root, try to acquire root and fork a new instance
 	that can use dumpav
 */
 int main(int argc, char *argv[]) {
 	string acl, output;
-
 	const char *args[] = {"/system/bin/id", nullptr};
+
+	files = (struct File *) mmap(nullptr, sizeof(struct File) * MAX_FILES, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+	if(files == (struct File *)-1) {
+		perror("mmap");
+		return -1;
+	}
+	*(int *)files = 1;
+
+	int fd = open("/data/local/tmp/AndroFace_tmp", O_CREAT | O_RDWR, 0666);
+	if(fd == -1) {
+		perror("open");
+		return -1;
+	}
+
 	exec("/system/bin/id", (char **)args, output);
+	
 	if(output.find("uid=0(root)") == string::npos) {
 		cout << "[.] Try to get root privilege.." << endl;
 
@@ -432,6 +442,16 @@ int main(int argc, char *argv[]) {
 			return -1;
 		} else {
 			waitpid(child, nullptr, __WALL);
+
+			read(fd, files, sizeof(struct File) * MAX_FILES);
+			close(fd);
+			remove("/data/local/tmp/AndroFace_tmp");
+
+			cout << "[.] data loaded" << endl;
+
+			// parent will get real acl now since it has local user privilege
+			if(*(int *)files > 1) // if pos is still 1 == no element has been found or we called get_reachable_from
+				show_attack_surface();
 			return 0;
 		}
 	}
@@ -447,11 +467,10 @@ int main(int argc, char *argv[]) {
 	else
 		help(argv);
 
+	write(fd, files, sizeof(struct File) * MAX_FILES);
+	close(fd);
+	cout << "[.] Child task over" << endl;
+
 	return 0;
 }
 
-/*
-security_context_t con;
-	getfilecon ("/dev/mali0", &con);
-	printf("Security context is %s\n", con);
-*/
